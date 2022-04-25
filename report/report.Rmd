@@ -1,0 +1,312 @@
+---
+title: "Cluster Analysis of Milwaukee Schools"
+logo: logo.png
+toc: true
+output: 
+  pdf_document:
+    includes:
+      in_header: header.tex
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(RColorBrewer)
+library(scales)
+library(wisconsink12)
+library(cityforwardcollective)
+library(sf)
+
+set.seed(1234)
+
+geo_schools_df <- read_csv("../../000_data_temp/geocoded_mke_schools.csv") %>%
+  select(school_year, dpi_true_id, lat, long)
+
+geo_schools <- geo_schools_df %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+sbds <- st_read("../../Shapefiles/Milwaukee/MPSSchoolBoardDistricts/MPS_School_Board_Districts.shp") %>%
+  st_transform(., crs = st_crs(4326)) %>%
+  group_by(SCHOOL) %>%
+  summarise()
+
+city_limits <- st_read("../../Shapefiles/Milwaukee/City Limits/citylimit.shp") %>%
+  st_transform(., crs = st_crs(4326))
+
+
+sbd_schools <- st_intersection(geo_schools, sbds)
+
+no_geo <- sbd_schools %>%
+  as_tibble() %>%
+  select(school_year,
+         dpi_true_id,
+         sbd = SCHOOL)
+
+```
+
+\newpage
+# Introduction
+
+The purpose of this analysis is to cluster Milwaukee K12 schools using a k-means clustering algorithm. We will evaluate two clustering methods:
+
+* Method A will not account for the physical location of the school 
+* Method B will account for the physical location of the school
+
+## Data
+
+The data used in this analysis is sourced primarily from the Wisconsin School Report Cards, though the physical school location is sourced from DPI School Directories.
+
+## Clustering Variables
+
+The variables used as inputs are those regarding the student body composition, i.e. racial subgroups, students with disabilities, English learner status, and economic status, all represented as a percentage of total school enrollment. Two racial subgroups were omitted from this analysis: 1) American Indian or Alaskan Native and 2) Native Hawaiian/Other Pacific Islander. These groups were omitted because they make up very small proportions of school enrollment citywide, so small differences had an outsized impact on clustering.
+
+The following variables were included:
+
+* Percent Asian 
+* Percent Black 
+* Percent Latino 
+* Percent two or more races
+* Percent white
+* Percent students with disabilities
+* Percent limited English proficiency
+* Percent economically disadvantaged
+* Latitude of school (Method B only)
+* Longitude of school (Method B only)
+
+# Analysis
+
+## Number of clusters
+
+To determine the number of clusters, we will use the elbow and the silhouette methods. Both of these methods provide a way to evaluate how well clusters are made so we can compare the outcomes of different numbers of clusters.
+
+The plot below shows the total within-cluster sum of squares (i.e. the intra-cluster variation) on the y axis, and the number of clusters on the x axis. We are looking to minimize the variation while keeping the number of clusters as small as we can. In other words, we want to find the point at which adding more clusters doesn't decrease variation enough to warrent adding that additional cluster. 
+
+```{r out.width="75%"}
+library(cluster)
+library(purrr)
+
+mke_rc <- make_mke_rc() %>%
+  left_join(., geo_schools_df)
+
+demo <- mke_rc %>%
+  filter(school_year == max(report_cards$school_year) & !is.na(per_am_in)) %>% 
+  select(per_am_in:per_lep) %>%
+  select(-c(per_am_in, per_nh_opi)) %>%
+  mutate_all(replace_na, replace = 0)
+
+demo_geo <- mke_rc %>%
+  filter(school_year == max(report_cards$school_year) & !is.na(per_am_in)) %>% 
+  select(per_am_in:per_lep,
+         lat, long) %>%
+  select(-c(per_am_in, per_nh_opi)) %>%
+  mutate_all(replace_na, replace = 0)
+
+scaled_demo <- scale(demo)
+
+dist_demo <- dist(scaled_demo)
+
+scaled_demo_geo <- scale(demo_geo)
+
+dist_demo_geo <- dist(scaled_demo_geo)
+
+
+tot_withinss <- map_dbl(1:10, function(k) {
+  model = kmeans(x = dist_demo, centers = k)
+  model$tot.withinss
+})
+
+elbow_df <- data.frame(
+  k = 1:10,
+  tot_withinss = tot_withinss
+)
+
+elbow_df %>%
+  ggplot(aes(k, tot_withinss)) +
+  geom_line() +
+  scale_x_continuous(breaks = 2:10) +
+  labs(title = "Elbow method",
+       x = "Number of Clusters",
+       y = "Intra-Cluster Variation")
+```
+
+When examining the plot, the optimum number of clusters is observed as an  "elbow" in the line. For our case here, four clusters seems to be that point. Now let's see what the silhouette shows us.
+
+The silhouette method will evaluate how well points fall within their clusters, and we are looking to maximize this measure, shown as the y axis on the plot below.
+
+```{r out.width="75%"}
+sil_width <- map_dbl(2:10, function(k){
+  model <- pam(x = dist_demo, k = k)
+  model$silinfo$avg.width
+})
+sil_df <- data.frame(
+  k = 2:10,
+  sil_width = sil_width
+)
+
+sil_df %>%
+  ggplot(aes(k, sil_width)) +
+  geom_line() +
+  scale_x_continuous(breaks = 2:10) +
+  labs(title = "Silhouette Method",
+       x = "Number of Clusters",
+       y = "Average Silhouette Width")
+```
+
+Based on this method, the optimal number of clusters is three instead of four. By default, we should be inclined towards fewer rather than more clusters, for the sake of interpretability. Further, doing a quick test of what the results would be with four clusters, we see one cluster only has 
+
+```{r}
+k_clust <- kmeans(dist_demo, centers = 4, iter.max = 1000, nstart = 100)
+k_clust_geo <- kmeans(dist_demo_geo, centers = 3, iter.max = 1000, nstart = 100)
+
+
+ach_clustered <- mke_rc %>%
+  filter(school_year == max(report_cards$school_year) & !is.na(per_am_in)) %>%
+  mutate(cluster = k_clust$cluster) %>%
+  left_join(., no_geo) 
+
+ach_clustered_geo <- mke_rc %>%
+  filter(school_year == max(report_cards$school_year) & !is.na(per_am_in)) %>%
+  mutate(cluster = k_clust_geo$cluster) %>%
+  left_join(., no_geo) 
+
+
+c_demo <- ach_clustered %>%
+  group_by(cluster) %>%
+  summarise_at(vars(per_am_in:per_lep, lat, long, overall_score, sch_ach, sch_growth), .funs = mean, na.rm = TRUE) %>%
+  modify_at(vars(per_am_in:per_lep), scales::percent) %>%
+  ungroup()
+
+
+c_demo_geo <- ach_clustered_geo %>%
+  group_by(cluster) %>%
+  summarise_at(vars(per_am_in:per_lep, lat, long, overall_score, sch_ach, sch_growth), .funs = mean, na.rm = TRUE) %>%
+  modify_at(vars(per_am_in:per_lep), scales::percent)
+```
+
+\newpage
+# Without Geo
+
+```{r}
+
+x <- ach_clustered %>%
+  mutate(sbd = replace_na(sbd, "None")) %>%
+  group_by(cluster, sbd) %>%
+  tally() %>%
+  pivot_wider(names_from = sbd, values_from = n)
+  
+c_demo %>%
+  select(cluster, per_b_aa, per_hisp_lat, per_white, per_asian, per_swd, per_ed, lat, long) %>%
+  left_join(., ach_clustered %>%
+                group_by(cluster) %>%
+                summarise(N = n()), by = "cluster") %>%
+  select("Cluster" = cluster,
+         N,
+         "Black" = per_b_aa,
+         "Hisp/Lat" = per_hisp_lat,
+         "White" = per_white,
+         "Asian" = per_asian,
+         "SwD" = per_swd,
+         "ECD" = per_ed) %>%
+  kable(booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r fig.height = 7}
+ach_clustered %>%
+  mutate(cluster = as.factor(cluster)) %>%
+  select(dpi_true_id,
+         cluster) %>%
+  left_join(., geo_schools) %>%
+  st_as_sf() %>%
+  ggplot() +
+  geom_sf(data = sbds) +
+  geom_sf_text(aes(label = SCHOOL), data = sbds %>% filter(SCHOOL != 7), inherit.aes = FALSE,
+               size = 5, color = "red") +
+  geom_sf_text(aes(label = SCHOOL), data = sbds %>% filter(SCHOOL == 7), inherit.aes = FALSE,
+               size = 5, nudge_y = -.01,  color = "red") +
+  geom_sf(aes(fill = cluster), alpha = .9, shape = 21) +
+  theme_void()
+
+```
+
+\newpage
+## With Geo
+
+```{r}
+c_demo_geo %>%
+  select(cluster, per_b_aa, per_hisp_lat, per_white, per_swd, per_ed, lat, long) %>%
+  modify_at(7:9, round, 1) %>%
+  left_join(., ach_clustered_geo %>%
+                group_by(cluster) %>%
+                summarise(N = n()), by = "cluster") %>%
+  select("Cluster" = cluster,
+         N,
+         "Black" = per_b_aa,
+         "Hisp/Lat" = per_hisp_lat,
+         "White" = per_white,
+         "SwD" = per_swd,
+         "ECD" = per_ed) %>%
+  kable(booktabs = T) %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+```{r fig.height = 7}
+ach_clustered_geo %>%
+  mutate(cluster = as.factor(cluster)) %>%
+  select(dpi_true_id,
+         cluster)  %>%
+  left_join(., geo_schools) %>%
+  st_as_sf() %>%
+  ggplot() +
+  geom_sf(data = sbds) +
+  geom_sf_text(aes(label = SCHOOL), data = sbds %>% filter(SCHOOL != 7), inherit.aes = FALSE,
+               size = 5, color = "red") +
+  geom_sf_text(aes(label = SCHOOL), data = sbds %>% filter(SCHOOL == 7), inherit.aes = FALSE,
+               size = 5, nudge_y = -.01,  color = "red") +
+  geom_sf(aes(fill = cluster), alpha = .9, shape = 21) +
+  theme_void()
+
+```
+
+\newpage
+## Comparing Differences
+
+```{r}
+
+diff <- ach_clustered %>%
+  select(dpi_true_id,
+         school_name,
+         per_b_aa,
+         per_hisp_lat,
+         per_white,
+         per_asian,
+         per_ed,
+         per_swd,
+         cluster_nogeo = cluster,
+         overall_rating) %>%
+  left_join(., ach_clustered_geo %>%
+              select(dpi_true_id,
+                     cluster_geo = cluster)) %>%
+  filter(cluster_nogeo != cluster_geo)
+
+diff
+
+ach_clustered_geo %>%
+  filter(dpi_true_id %in% diff$dpi_true_id) %>%
+  mutate(cluster = as.factor(cluster)) %>%
+  select(dpi_true_id,
+         cluster)  %>%
+  left_join(., geo_schools) %>%
+  st_as_sf() %>%
+  ggplot() +
+  geom_sf(data = sbds) +
+  geom_sf_text(aes(label = SCHOOL), data = sbds %>% filter(SCHOOL != 7), inherit.aes = FALSE,
+               size = 5, color = "red") +
+  geom_sf_text(aes(label = SCHOOL), data = sbds %>% filter(SCHOOL == 7), inherit.aes = FALSE,
+               size = 5, nudge_y = -.01,  color = "red") +
+  geom_sf(aes(fill = cluster), alpha = .9, shape = 21) +
+  geom_sf_text(aes(label = dpi_true_id)) +
+  theme_void()
+
+```
