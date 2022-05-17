@@ -23,7 +23,7 @@ library(cluster)
 library(purrr)
 
 set.seed(1234)
-
+setwd("report")
 geo_schools_df <- read_csv("../../000_data_temp/geocoded_mke_schools.csv") %>%
   select(school_year, dpi_true_id, lat, long)
 
